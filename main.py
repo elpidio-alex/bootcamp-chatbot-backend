@@ -1,16 +1,19 @@
+import json
 import os
+from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import and_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database.db import get_db
+from database.db import SessionLocal, get_db
 from database.models import Conversation, Message
 
 load_dotenv()
@@ -33,7 +36,7 @@ NOTIFICATION_ROLE = "system-notification"
 NOTIFICATION_EVERY = 10  # a notification each time the dialogue reaches a multiple of this many messages
 NOTIFICATION_TEXT = "Notification système : Une dizaine de messages écrits."
 
-# QUIZ : rôle custom. Une question de révision est ajoutée toutes les QUIZ_EVERY_N questions de l'étudiant.
+# Rôle custom : une question de révision est ajoutée toutes les QUIZ_EVERY_N questions de l'étudiant.
 QUIZ_ROLE = "quiz"
 QUIZ_EVERY_N = int(os.getenv("QUIZ_EVERY_N", "3"))
 QUIZ_SEPARATOR = "===QUIZ==="
@@ -56,12 +59,6 @@ class ChatRequest(BaseModel):
     conversation_id: int
     message: str
     model: str | None = None  # le client propose, le serveur décide
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    notification: str | None = None  # set when this turn also stored a system-notification
-    quiz: str | None = None  # QUIZ : set when this turn also stored a quiz question
 
 
 class MessageResponse(BaseModel):
@@ -102,14 +99,147 @@ def build_llm_history(rows: list[Message]) -> list[dict]:
     return history
 
 
-def split_quiz(reply: str) -> tuple[str, str | None]:
-    # QUIZ : separate the normal answer from the quiz question the LLM appended after the separator.
-    # No separator (the LLM forgot) -> no quiz, the whole reply is the answer.
-    answer, separator, quiz = reply.partition(QUIZ_SEPARATOR)
-    quiz = quiz.strip()
-    if not separator or not quiz:
-        return reply.strip(), None
-    return answer.strip(), quiz
+class QuizSplitter:
+    """Splits the streamed reply into the answer and the quiz question, chunk by chunk.
+
+    The separator can arrive cut in two chunks ("===QU" then "IZ==="): the tail of the text that
+    could be the beginning of the separator is held back until we know what it is.
+    """
+
+    def __init__(self, active: bool):
+        self.active = active  # False on turns without quiz: everything is the answer
+        self.answer = ""  # what was sent to the client as the answer
+        self.quiz = ""  # what came after the separator
+        self._buffer = ""  # held-back tail
+        self._in_quiz = False
+
+    def feed(self, chunk: str) -> str:
+        # Returns the part of the answer that is safe to send to the client now.
+        if not self.active:
+            self.answer += chunk
+            return chunk
+        if self._in_quiz:
+            self.quiz += chunk
+            return ""
+        self._buffer += chunk
+        index = self._buffer.find(QUIZ_SEPARATOR)
+        if index != -1:
+            out = self._buffer[:index]
+            self.quiz = self._buffer[index + len(QUIZ_SEPARATOR):]
+            self._buffer = ""
+            self._in_quiz = True
+        else:
+            hold = 0
+            for size in range(min(len(QUIZ_SEPARATOR) - 1, len(self._buffer)), 0, -1):
+                if QUIZ_SEPARATOR.startswith(self._buffer[-size:]):
+                    hold = size
+                    break
+            out = self._buffer[: len(self._buffer) - hold]
+            self._buffer = self._buffer[len(self._buffer) - hold:]
+        self.answer += out
+        return out
+
+    def finish(self) -> str:
+        # End of stream: release a held-back tail that never became a separator.
+        out, self._buffer = self._buffer, ""
+        self.answer += out
+        return out
+
+
+def sse(event: dict) -> str:
+    # One Server-Sent Event line: the frontend reads "data: {...}" blocks separated by a blank line.
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def save_turn(conversation_id: int, first_seq: int, turn: list[tuple[str, str]]) -> None:
+    # A dedicated session: the request's session may already be closed once the stream is running.
+    # The unique (conversation_id, seq) constraint rejects a concurrent write of the same turn.
+    with SessionLocal() as db:
+        db.add_all(
+            Message(conversation_id=conversation_id, seq=first_seq + i, role=role, content=content)
+            for i, (role, content) in enumerate(turn)
+        )
+        db.commit()
+
+
+async def stream_turn(
+    conversation_id: int,
+    user_text: str,
+    next_seq: int,
+    payload: dict,
+    quiz_due: bool,
+    dialogue_count: int,
+) -> AsyncIterator[str]:
+    splitter = QuizSplitter(active=quiz_due)
+    usage = None
+    finished = False  # True once the turn is saved, or deliberately dropped because of an error
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+            async with client.stream(
+                "POST",
+                RODIUMAI_URL,
+                headers={"Authorization": f"Bearer {RODIUMAI_API_KEY}"},
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    chunk = json.loads(data)
+                    usage = chunk.get("usage") or usage
+                    choices = chunk.get("choices") or []
+                    text = choices[0].get("delta", {}).get("content") if choices else None
+                    if text:
+                        safe = splitter.feed(text)
+                        if safe:
+                            yield sse({"type": "delta", "content": safe})
+
+        tail = splitter.finish()
+        if tail:
+            yield sse({"type": "delta", "content": tail})
+
+        answer = splitter.answer.strip()
+        quiz = splitter.quiz.strip() or None
+        if not answer:
+            raise ValueError("Empty reply from the LLM.")
+
+        turn = [("user", user_text), ("assistant", answer)]
+        if quiz:
+            turn.append((QUIZ_ROLE, quiz))
+        notification = None
+        if dialogue_count % NOTIFICATION_EVERY == 0:
+            notification = NOTIFICATION_TEXT
+            turn.append((NOTIFICATION_ROLE, notification))
+
+        # The turn is written only now, once the whole reply is in: an error before this point leaves the DB untouched.
+        save_turn(conversation_id, next_seq, turn)
+        finished = True
+
+        if quiz:
+            yield sse({"type": "quiz", "content": quiz})
+        if notification:
+            yield sse({"type": "notification", "content": notification})
+        yield sse({"type": "done", "usage": usage})
+
+    except IntegrityError:
+        finished = True
+        yield sse({"type": "error", "message": "The conversation was updated concurrently, please retry."})
+    except (httpx.HTTPError, ValueError):  # ValueError also covers json.JSONDecodeError
+        finished = True  # error: nothing is written, the student can resend the message
+        yield sse({"type": "error", "message": "The LLM API call failed."})
+    finally:
+        if not finished:
+            # The client went away mid-stream (Stop button, closed tab): keep what it already received.
+            partial = splitter.answer.strip()
+            if partial:
+                try:
+                    save_turn(conversation_id, next_seq, [("user", user_text), ("assistant", partial)])
+                except IntegrityError:
+                    pass  # concurrent update: nothing to keep
 
 
 @app.get("/models")
@@ -152,79 +282,44 @@ def list_messages(conversation_id: int, db: Session = Depends(get_db)) -> list[M
 
 
 @app.post("/chat")
-def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
+def chat(req: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
     # Never trust the client: the model must be in the server-side allowlist (checked before any DB/LLM work).
     model = req.model or DEFAULT_MODEL
     if model not in ALLOWED_MODELS:
         raise HTTPException(status_code=400, detail="Model not allowed.")
 
-    # Load this conversation from the database, in message order.
+    # Everything that can fail with a normal HTTP error (404...) happens here, before the stream starts.
     rows = load_messages(db, req.conversation_id)
     history = build_llm_history(rows)
-    # seq follows every stored row (notifications and quiz included) so it stays unique.
-    next_seq = rows[-1].seq + 1 if rows else 1
-    user_message = {"role": "user", "content": req.message}
+    next_seq = rows[-1].seq + 1 if rows else 1  # follows every stored row so it stays unique
 
-    # QUIZ : count the student's questions (this one included). Every QUIZ_EVERY_N-th one gets a quiz question.
+    # Every QUIZ_EVERY_N-th question of the student (this one included) gets a quiz question.
     user_turns = sum(1 for m in rows if m.role == "user") + 1
     quiz_due = user_turns % QUIZ_EVERY_N == 0
+    # Dialogue only (user + assistant, quiz excluded), so notifications and quiz don't shift the multiples of 10.
+    dialogue_count = sum(1 for m in rows if m.role in LLM_ROLES) + 2
 
     # The extra quiz instruction only exists in THIS request: it is never stored in the database.
     system_prompt = SYSTEM_PROMPT + ("\n\n" + QUIZ_INSTRUCTION if quiz_due else "")
 
     # The LLM is stateless: resend the system prompt + the whole conversation each turn.
-    messages = [{"role": "system", "content": system_prompt}, *history, user_message]
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            *history,
+            {"role": "user", "content": req.message},
+        ],
+        "max_tokens": 768,
+        "stream": True,
+        "stream_options": {"include_usage": True},  # ask for the token usage in the last chunk
+    }
 
-    try:
-        response = httpx.post(
-            RODIUMAI_URL,
-            headers={"Authorization": f"Bearer {RODIUMAI_API_KEY}"},
-            json={
-                "model": model,
-                "messages": messages,
-                "max_tokens": 768,  # QUIZ : room for the answer + the quiz question
-                "stream": False,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="The LLM API call failed.") from exc
-
-    reply = response.json()["choices"][0]["message"]["content"]
-
-    # QUIZ : on a quiz turn, split the LLM output into the answer and the quiz question.
-    quiz = None
-    if quiz_due:
-        reply, quiz = split_quiz(reply)
-
-    # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
-    turn = [("user", req.message), ("assistant", reply)]
-    if quiz:
-        turn.append((QUIZ_ROLE, quiz))
-
-    # Count only the dialogue (user + assistant, quiz excluded) so notifications and quiz
-    # don't shift the total off the multiples of 10.
-    dialogue_count = sum(1 for m in rows if m.role in LLM_ROLES) + 2
-    notification = None
-    if dialogue_count % NOTIFICATION_EVERY == 0:
-        notification = NOTIFICATION_TEXT
-        turn.append((NOTIFICATION_ROLE, notification))
-
-    db.add_all(
-        Message(conversation_id=req.conversation_id, seq=next_seq + i, role=role, content=content)
-        for i, (role, content) in enumerate(turn)
+    return StreamingResponse(
+        stream_turn(req.conversation_id, req.message, next_seq, payload, quiz_due, dialogue_count),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-
-    try:
-        db.commit()
-    except IntegrityError:
-        # Another request already wrote these seq numbers in this conversation while we waited for the LLM.
-        db.rollback()
-        raise HTTPException(
-            status_code=409, detail="The conversation was updated concurrently, please retry."
-        )
-    return ChatResponse(reply=reply, notification=notification, quiz=quiz)
 
 
 if __name__ == "__main__":
