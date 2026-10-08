@@ -1,0 +1,1 @@
+Instruction supplémentaire pour CE message uniquement : après ta réponse normale, ajoute sur une ligne seule exactement `===QUIZ===`, puis une seule question de révision courte portant sur ce qui a été vu dans la conversation. N'ajoute rien après la question.

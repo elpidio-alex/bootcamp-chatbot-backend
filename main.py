@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -16,19 +17,21 @@ load_dotenv()
 
 RODIUMAI_URL = "https://api.rodiumai.io/v1/chat/completions"
 RODIUMAI_API_KEY = os.environ["RODIUMAI_API_KEY"]
-MODEL = os.getenv("RODIUMAI_MODEL", "anthropic/claude-sonnet-4-5-20250929")
 PREVIEW_LENGTH = 60
+
+# Liste des modèles définie côté serveur : le client ne peut jamais en sortir.
+ALLOWED_MODELS = [m.strip() for m in os.environ["ALLOWED_MODELS"].split(",") if m.strip()]
+DEFAULT_MODEL = ALLOWED_MODELS[0]
+
+# Le prompt vit dans un fichier dédié ; SYSTEM_PROMPT_FILE permet de comparer ancien/nouveau (fiche de test).
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+SYSTEM_PROMPT = (PROMPTS_DIR / os.getenv("SYSTEM_PROMPT_FILE", "system.md")).read_text(encoding="utf-8")
 
 # Roles the LLM understands. Anything else stored in the DB (e.g. notifications) stays out of its prompt.
 LLM_ROLES = {"user", "assistant"}
 NOTIFICATION_ROLE = "system-notification"
 NOTIFICATION_EVERY = 10  # a notification each time the dialogue reaches a multiple of this many messages
 NOTIFICATION_TEXT = "Notification système : Une dizaine de messages écrits."
-
-SYSTEM_PROMPT = (
-    "Tu es Study Buddy, un tuteur bienveillant pour les étudiants."
-    "Réponds aux questions de manière claire et concise."
-)
 
 app = FastAPI(title="Study Buddy Chatbot")
 
@@ -46,6 +49,7 @@ class ConversationSummary(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: int
     message: str
+    model: str | None = None  # le client propose, le serveur décide
 
 
 class ChatResponse(BaseModel):
@@ -75,6 +79,11 @@ def build_llm_history(rows: list[Message]) -> list[dict]:
     # The DB history is not necessarily what the LLM sees: filter it here, just before building the request.
     # For now we only drop the roles the LLM doesn't know (system-notification).
     return [{"role": m.role, "content": m.content} for m in rows if m.role in LLM_ROLES]
+
+
+@app.get("/models")
+def list_models() -> list[str]:
+    return ALLOWED_MODELS
 
 
 @app.post("/conversations", status_code=201)
@@ -113,6 +122,11 @@ def list_messages(conversation_id: int, db: Session = Depends(get_db)) -> list[M
 
 @app.post("/chat")
 def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
+    # Never trust the client: the model must be in the server-side allowlist (checked before any DB/LLM work).
+    model = req.model or DEFAULT_MODEL
+    if model not in ALLOWED_MODELS:
+        raise HTTPException(status_code=400, detail="Model not allowed.")
+
     # Load this conversation from the database, in message order.
     rows = load_messages(db, req.conversation_id)
     history = build_llm_history(rows)
@@ -128,8 +142,8 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
             RODIUMAI_URL,
             headers={"Authorization": f"Bearer {RODIUMAI_API_KEY}"},
             json={
-                "model": MODEL,
-                "messages": messages, 
+                "model": model,
+                "messages": messages,
                 "max_tokens": 512,
                 "stream": False,
             },
@@ -164,5 +178,10 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         raise HTTPException(
             status_code=409, detail="The conversation was updated concurrently, please retry."
         )
-    print(history)
     return ChatResponse(reply=reply, notification=notification)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
