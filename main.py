@@ -33,6 +33,12 @@ NOTIFICATION_ROLE = "system-notification"
 NOTIFICATION_EVERY = 10  # a notification each time the dialogue reaches a multiple of this many messages
 NOTIFICATION_TEXT = "Notification système : Une dizaine de messages écrits."
 
+# QUIZ : rôle custom. Une question de révision est ajoutée toutes les QUIZ_EVERY_N questions de l'étudiant.
+QUIZ_ROLE = "quiz"
+QUIZ_EVERY_N = int(os.getenv("QUIZ_EVERY_N", "3"))
+QUIZ_SEPARATOR = "===QUIZ==="
+QUIZ_INSTRUCTION = (PROMPTS_DIR / "quiz_instruction.md").read_text(encoding="utf-8")
+
 app = FastAPI(title="Study Buddy Chatbot")
 
 
@@ -55,6 +61,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     notification: str | None = None  # set when this turn also stored a system-notification
+    quiz: str | None = None  # QUIZ : set when this turn also stored a quiz question
 
 
 class MessageResponse(BaseModel):
@@ -76,9 +83,33 @@ def load_messages(db: Session, conversation_id: int) -> list[Message]:
 
 
 def build_llm_history(rows: list[Message]) -> list[dict]:
-    # The DB history is not necessarily what the LLM sees: filter it here, just before building the request.
-    # For now we only drop the roles the LLM doesn't know (system-notification).
-    return [{"role": m.role, "content": m.content} for m in rows if m.role in LLM_ROLES]
+    # The DB history is not necessarily what the LLM sees: transform/filter it here, just before building the request.
+    # - system-notification: unknown to the LLM -> dropped.
+    # - quiz: transformed into "assistant", so the LLM knows it asked that question and understands the student's answer.
+    # - consecutive assistant messages (answer + quiz) are merged: some providers dislike two same roles in a row.
+    history: list[dict] = []
+    for m in rows:
+        if m.role == QUIZ_ROLE:
+            role = "assistant"
+        elif m.role in LLM_ROLES:
+            role = m.role
+        else:
+            continue
+        if history and history[-1]["role"] == "assistant" and role == "assistant":
+            history[-1]["content"] += "\n\n" + m.content
+        else:
+            history.append({"role": role, "content": m.content})
+    return history
+
+
+def split_quiz(reply: str) -> tuple[str, str | None]:
+    # QUIZ : separate the normal answer from the quiz question the LLM appended after the separator.
+    # No separator (the LLM forgot) -> no quiz, the whole reply is the answer.
+    answer, separator, quiz = reply.partition(QUIZ_SEPARATOR)
+    quiz = quiz.strip()
+    if not separator or not quiz:
+        return reply.strip(), None
+    return answer.strip(), quiz
 
 
 @app.get("/models")
@@ -130,12 +161,19 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     # Load this conversation from the database, in message order.
     rows = load_messages(db, req.conversation_id)
     history = build_llm_history(rows)
-    # seq follows every stored row (notifications included) so it stays unique.
+    # seq follows every stored row (notifications and quiz included) so it stays unique.
     next_seq = rows[-1].seq + 1 if rows else 1
     user_message = {"role": "user", "content": req.message}
 
+    # QUIZ : count the student's questions (this one included). Every QUIZ_EVERY_N-th one gets a quiz question.
+    user_turns = sum(1 for m in rows if m.role == "user") + 1
+    quiz_due = user_turns % QUIZ_EVERY_N == 0
+
+    # The extra quiz instruction only exists in THIS request: it is never stored in the database.
+    system_prompt = SYSTEM_PROMPT + ("\n\n" + QUIZ_INSTRUCTION if quiz_due else "")
+
     # The LLM is stateless: resend the system prompt + the whole conversation each turn.
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, user_message]
+    messages = [{"role": "system", "content": system_prompt}, *history, user_message]
 
     try:
         response = httpx.post(
@@ -144,7 +182,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
             json={
                 "model": model,
                 "messages": messages,
-                "max_tokens": 512,
+                "max_tokens": 768,  # QUIZ : room for the answer + the quiz question
                 "stream": False,
             },
             timeout=30,
@@ -155,20 +193,28 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
 
     reply = response.json()["choices"][0]["message"]["content"]
 
-    # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
-    db.add_all([
-        Message(conversation_id=req.conversation_id, seq=next_seq, role="user", content=req.message),
-        Message(conversation_id=req.conversation_id, seq=next_seq + 1, role="assistant", content=reply),
-    ])
+    # QUIZ : on a quiz turn, split the LLM output into the answer and the quiz question.
+    quiz = None
+    if quiz_due:
+        reply, quiz = split_quiz(reply)
 
-    # Count only the dialogue (user + assistant): counting notifications too would shift the total
-    # off the multiples of 10 for good after the first one.
+    # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
+    turn = [("user", req.message), ("assistant", reply)]
+    if quiz:
+        turn.append((QUIZ_ROLE, quiz))
+
+    # Count only the dialogue (user + assistant, quiz excluded) so notifications and quiz
+    # don't shift the total off the multiples of 10.
+    dialogue_count = sum(1 for m in rows if m.role in LLM_ROLES) + 2
     notification = None
-    if (len(history) + 2) % NOTIFICATION_EVERY == 0:
+    if dialogue_count % NOTIFICATION_EVERY == 0:
         notification = NOTIFICATION_TEXT
-        db.add(Message(
-            conversation_id=req.conversation_id, seq=next_seq + 2, role=NOTIFICATION_ROLE, content=notification
-        ))
+        turn.append((NOTIFICATION_ROLE, notification))
+
+    db.add_all(
+        Message(conversation_id=req.conversation_id, seq=next_seq + i, role=role, content=content)
+        for i, (role, content) in enumerate(turn)
+    )
 
     try:
         db.commit()
@@ -178,7 +224,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         raise HTTPException(
             status_code=409, detail="The conversation was updated concurrently, please retry."
         )
-    return ChatResponse(reply=reply, notification=notification)
+    return ChatResponse(reply=reply, notification=notification, quiz=quiz)
 
 
 if __name__ == "__main__":
