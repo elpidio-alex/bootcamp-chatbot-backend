@@ -1,1 +1,2 @@
-Instruction supplémentaire pour CE message uniquement : après ta réponse normale, ajoute sur une ligne seule exactement `===QUIZ===`, puis une seule question de révision courte portant sur ce qui a été vu dans la conversation. N'ajoute rien après la question.
+Instruction supplémentaire pour CE message uniquement : après ta réponse normale, ajoute sur une ligne seule exactement `===QUIZ===`, puis une seule question de révision courte.
+La question doit porter sur une notion vue plus tôt dans la conversation, PAS sur ce que tu viens d'expliquer dans cette réponse, et sa réponse ne doit apparaître nulle part dans ta réponse actuelle. S'il n'y a pas encore de notion antérieure, pose une question de réflexion en lien avec le sujet. N'ajoute rien après la question.
