@@ -265,7 +265,7 @@ requirements.txt             dépendances (pyproject.toml pour uv)
 
 ## Auteur
 
-**Alex** — Étudiant en Licence Professionnelle Cybersécurité, iPNet Institute of Technology, Lomé (Togo).
+**Elpidio Alexis AMOUSSOU** — Étudiant en Licence Professionnelle Cybersécurité, iPNet Institute of Technology, Lomé (Togo).
 
 - GitHub : [github.com/elpidio-alex](https://github.com/elpidio-alex)
 
