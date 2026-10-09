@@ -44,6 +44,18 @@ QUIZ_INSTRUCTION = (PROMPTS_DIR / "quiz_instruction.md").read_text(encoding="utf
 
 app = FastAPI(title="Study Buddy Chatbot")
 
+from fastapi.middleware.cors import CORSMiddleware  # à mettre avec les autres imports, en haut
+
+# Origines autorisées à appeler l'API depuis un navigateur (le front déployé). Vide en local : le proxy Vite suffit.
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+    )
+
 
 class ConversationResponse(BaseModel):
     conversation_id: int
@@ -325,4 +337,8 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    port = os.getenv("PORT")  # défini par l'hébergeur (Render...), absent en local
+    if port:
+        uvicorn.run("main:app", host="0.0.0.0", port=int(port))
+    else:
+        uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
